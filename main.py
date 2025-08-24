@@ -1,370 +1,340 @@
 # -*- coding: utf-8 -*-
 """
-PisosYTechos Bot (Deriv API + Telegram) — versión Nivel PRO
+PisosYTechos Bot (Deriv API + Telegram)
 
-➤ Escanea VOLATILITY (incluye 1HZ series).
-➤ Timeframes: M15, M30, H1, H4, D1.
-➤ Detecta SÓLO pisos/techos FUERTES y CLAROS:
-    - Clusters de pivotes (mínimo de toques).
-    - Confluencia por ATR (nivel dentro de k*ATR).
-    - Rechazo con mecha (mecha/cuerpo alto).
-    - Entrada con momentum (aceleración previa al nivel).
+• Escanea Volatility, Jump (1Hz), Step y Multi-Step.
+• Timeframes: M15, M30, H1, H4, D1.
+• Detecta PISOS/TECHOS claros por clusters de pivotes/wicks (“rechazos”).
+• Solo envía ALERTAS DE ACERCAMIENTO (no rompe-niveles).
+• SL = ATR × SL_ATR_FACTOR (por detrás del nivel)
+• TP con R/R fijo (default 1:10)
+• Notifica por Telegram con nombre legible del instrumento.
 
-➤ Envia ALERTAS de ACERCAMIENTO (no ruptura) por Telegram.
+Requiere variables de entorno:
+DERIV_APP_ID, TG_TOKEN, TG_CHAT
+Opcionales:
+ATR_PERIOD, SL_ATR_FACTOR, RR_RATIO, MIN_TOUCHES, NEAR_ATR, MAX_LEVELS_PER_TF
 """
 
-import os
-import time
-import json
-import math
-import traceback
-import threading
-from collections import defaultdict, deque
+import os, time, json, math, traceback
+import requests
+import websocket
 
-import websocket  # websocket-client
-import requests  # Telegram
+# ------------ Config desde ENV ------------
+DERIV_TOKEN     = os.getenv("DERIV_TOKEN", "")
+DERIV_APP_ID    = os.getenv("DERIV_APP_ID", "")
+TG_TOKEN        = os.getenv("TG_TOKEN", "")
+TG_CHAT         = os.getenv("TG_CHAT", "")
 
-# ------------- Config desde ENV (con defaults sensatos) -------------
-DERIV_TOKEN   = os.getenv("DERIV_TOKEN", "")
-DERIV_APP_ID  = os.getenv("DERIV_APP_ID", "")
-TG_TOKEN      = os.getenv("TG_TOKEN", "")
-TG_CHAT       = os.getenv("TG_CHAT", "")
+ATR_PERIOD      = int(os.getenv("ATR_PERIOD", "14"))
+SL_ATR_FACTOR   = float(os.getenv("SL_ATR_FACTOR", "1.0"))
+RR_RATIO        = float(os.getenv("RR_RATIO", "10"))
 
-ATR_PERIOD        = int(os.getenv("ATR_PERIOD", "14"))
-SL_ATR_FACTOR     = float(os.getenv("SL_ATR_FACTOR", "1.0"))
-RR_RATIO          = float(os.getenv("RR_RATIO", "10"))
-MIN_TOUCHES       = int(os.getenv("MIN_TOUCHES", "3"))          # mínimo de toques para que sea nivel fuerte
-MAX_DISTANCE_PCT  = float(os.getenv("MAX_DISTANCE_PCT", "0.20")) # 0.20% (tolerancia de cluster)
-LOOKBACK_BARS     = int(os.getenv("LOOKBACK_BARS", "250"))      # muestra para análisis por TF
+# Sensibilidad de niveles / alertas
+MIN_TOUCHES         = int(os.getenv("MIN_TOUCHES", "5"))     # rechazos mínimos para considerar nivel
+NEAR_ATR            = float(os.getenv("NEAR_ATR", "1.2"))    # cuántos ATRs cuenta como “acercándose”
+MAX_LEVELS_PER_TF   = int(os.getenv("MAX_LEVELS_PER_TF", "1"))
 
-# Símbolos volátiles (puedes agregar/quitar)
-SYMBOLS = [
-    "1HZ10V", "1HZ25V", "1HZ50V", "1HZ75V", "1HZ100V", "JD10", "JD25", "JD50", "JD75", "JD100"
-]
-
-# Timeframes Deriv (en segundos)
-TIMEFRAMES = {
-    "M15":  15 * 60,
-    "M30":  30 * 60,
-    "H1":   60 * 60,
-    "H4":   4  * 60 * 60,
-    "D1":   24 * 60 * 60,
+# Timeframes a escanear
+TF_MAP = {
+    "M15": 900,
+    "M30": 1800,
+    "H1": 3600,
+    "H4": 14400,
+    "D1": 86400,
 }
 
-DERIV_WS_URL = f"wss://ws.derivws.com/websockets/v3?app_id={DERIV_APP_ID}"
+# Se rellenan al arrancar
+SYMBOLS = []
+NOMBRE_LEGIBLE = {}
 
-# -------------------- Utilidades --------------------
-def send_telegram(text: str):
+
+# ------------ Utilidades HTTP/WS ------------
+def tg_send(text):
+    """Envía mensaje a Telegram."""
     if not TG_TOKEN or not TG_CHAT:
-        print("TG no configurado: ", text[:120])
         return
     try:
-        url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-        requests.post(url, json={"chat_id": TG_CHAT, "text": text, "parse_mode": "HTML"}, timeout=10)
-    except Exception as e:
-        print("Error enviando a Telegram:", e)
+        requests.post(
+            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+            data={"chat_id": TG_CHAT, "text": text}
+        )
+    except Exception:
+        pass
 
-def percent_dist(a, b):
-    return abs(a - b) / ((a + b) / 2.0) * 100.0
 
-def atr_from_candles(candles, period=14):
-    # True Range clásica con prev close
+def ws_call(payload, timeout=25):
+    """Llamada corta al WS de Deriv (conecta, manda, recibe, cierra)."""
+    url = "wss://ws.derivws.com/websockets/v3?app_id=" + str(DERIV_APP_ID)
+    ws = websocket.create_connection(url, timeout=timeout)
+    ws.send(json.dumps(payload))
+    raw = ws.recv()
+    ws.close()
+    return json.loads(raw)
+
+
+# ------------ Descubrir símbolos + nombres ------------
+def descubrir_simbolos_y_nombres():
+    """
+    Devuelve (lista_simbolos, dict_nombre_legible)
+    Incluye Volatility, Jump, Step y Multi-Step cuando estén disponibles.
+    """
+    try:
+        resp = ws_call({"active_symbols": "brief", "product_type": "basic"})
+        items = resp.get("active_symbols", []) if isinstance(resp, dict) else []
+    except Exception:
+        items = []
+
+    simbolos, nombres = [], {}
+    SUBMERCADOS_OK = {
+        "Volatility Indices",
+        "Jump Indices",
+        "Step Indices",
+        "Multi Step Indices",
+    }
+    for it in items:
+        # Algunos tenants usan submarket o submarket_display_name
+        submarket = it.get("submarket") or it.get("submarket_display_name") or ""
+        if submarket in SUBMERCADOS_OK:
+            s = it.get("symbol")
+            dn = it.get("display_name") or s
+            if s:
+                simbolos.append(s)
+                nombres[s] = dn
+
+    # Respaldo si no devolvió nada
+    if not simbolos:
+        simbolos = [
+            # Volatility
+            "R_10", "R_25", "R_50", "R_75", "R_100",
+            # Jump (1Hz)
+            "1HZ10V", "1HZ25V", "1HZ50V", "1HZ75V", "1HZ100V",
+            # Step / Multi (nombres pueden variar por cuenta)
+            "STEP_INDEX", "STEP_INDEX_2", "STEP_INDEX_3", "STEP_INDEX_4", "STEP_INDEX_5",
+            "MULTI_STEP_INDEX_1", "MULTI_STEP_INDEX_2", "MULTI_STEP_INDEX_3",
+        ]
+        for s in simbolos:
+            nombres[s] = s
+
+    return simbolos, nombres
+
+
+# ------------ Datos de velas + indicadores ------------
+def pedir_velas(symbol, granularity, count=500):
+    """
+    Pide velas OHLC a Deriv (candles).
+    Retorna lista de dicts con epoch, open, high, low, close.
+    """
+    payload = {
+        "ticks_history": symbol,
+        "adjust_start_time": 1,
+        "count": count,
+        "granularity": granularity,
+        "style": "candles",
+    }
+    data = ws_call(payload)
+    c = data.get("candles") or []
+    # normalizamos
+    velas = []
+    for it in c:
+        velas.append({
+            "t": it.get("epoch"),
+            "o": float(it.get("open")),
+            "h": float(it.get("high")),
+            "l": float(it.get("low")),
+            "c": float(it.get("close")),
+        })
+    return velas
+
+
+def calc_atr(velas, period=14):
+    """ATR simple sobre high/low/close."""
+    if len(velas) < period + 1:
+        return 0.0
     trs = []
-    for i in range(1, len(candles)):
-        h = candles[i]["high"]
-        l = candles[i]["low"]
-        pc = candles[i-1]["close"]
+    for i in range(1, len(velas)):
+        h = velas[i]["h"]; l = velas[i]["l"]; pc = velas[i-1]["c"]
         tr = max(h - l, abs(h - pc), abs(l - pc))
         trs.append(tr)
-    if len(trs) < period:
-        return None
-    # ATR simple
-    return sum(trs[-period:]) / period
+    trs = trs[-period:]
+    return sum(trs) / max(1, len(trs))
 
-def pivot_points(candles, left=2, right=2):
+
+# ------------ Detección de pisos/techos claros ------------
+def pivotes(velas, win=3):
     """
-    Detecta pivotes simples (alto/bajo local). Devuelve lista de dicts:
-      {"idx": i, "price": nivel, "type": "piso"|"techo"}
+    Devuelve listas de índices que son pivote alto y pivote bajo (locales).
+    win=3 -> compara 3 velas a cada lado.
     """
-    pivs = []
-    for i in range(left, len(candles) - right):
-        highs = [candles[i - j]["high"] for j in range(left, 0, -1)] + [candles[i]["high"]] + [candles[i + j]["high"] for j in range(1, right + 1)]
-        lows  = [candles[i - j]["low"]  for j in range(left, 0, -1)] + [candles[i]["low"]]  + [candles[i + j]["low"]  for j in range(1, right + 1)]
-        c = candles[i]
-        if c["high"] == max(highs):
-            pivs.append({"idx": i, "price": c["high"], "type": "techo"})
-        if c["low"] == min(lows):
-            pivs.append({"idx": i, "price": c["low"], "type": "piso"})
-    return pivs
+    highs, lows = [], []
+    n = len(velas)
+    for i in range(win, n - win):
+        h = velas[i]["h"]; l = velas[i]["l"]
+        if all(h >= velas[i-k]["h"] for k in range(1, win+1)) and all(h >= velas[i+k]["h"] for k in range(1, win+1)):
+            highs.append(i)
+        if all(l <= velas[i-k]["l"] for k in range(1, win+1)) and all(l <= velas[i+k]["l"] for k in range(1, win+1)):
+            lows.append(i)
+    return highs, lows
 
-def cluster_levels(pivots, max_pct, last_close):
+
+def cluster_niveles(precios, tolerancia):
     """
-    Agrupa pivotes por cercanía porcentual (max_pct). Devuelve niveles:
-      [{"price": nivel_medio, "type": "piso"/"techo", "touches": n, "members": [...]}]
-    Filtra por mayoría de tipo (si mezcla, toma el dominante).
+    Agrupa precios cercanos (|a-b| <= tolerancia).
+    Retorna lista de (nivel, cantidad, elementos).
     """
-    clusters = []
-    used = set()
-    for i, p in enumerate(pivots):
-        if i in used:
-            continue
-        group = [p]
-        used.add(i)
-        for j in range(i + 1, len(pivots)):
-            if j in used:
-                continue
-            if percent_dist(p["price"], pivots[j]["price"]) <= max_pct:
-                group.append(pivots[j])
-                used.add(j)
-        # Tipo dominante
-        types = defaultdict(int)
-        for m in group:
-            types[m["type"]] += 1
-        t = "piso" if types["piso"] >= types["techo"] else "techo"
-        price = sum(m["price"] for m in group) / len(group)
-        clusters.append({
-            "price": price,
-            "type": t,
-            "touches": len(group),
-            "members": group
-        })
-    # Orden por cercanía al precio actual (priorizar niveles relevantes)
-    clusters.sort(key=lambda x: abs(x["price"] - last_close))
-    return clusters
-
-def wick_rejection_score(candle, level_type, near_level=True):
-    """
-    Mide rechazo de mecha:
-      - techo: mecha superior larga y cuerpo pequeño
-      - piso:  mecha inferior larga y cuerpo pequeño
-    Devuelve score [0..1]. >0.6 = buen rechazo.
-    """
-    h, l, o, c = candle["high"], candle["low"], candle["open"], candle["close"]
-    body = abs(c - o)
-    range_ = max(1e-9, h - l)
-    upper_w = h - max(o, c)
-    lower_w = min(o, c) - l
-
-    if range_ <= 0:
-        return 0.0
-
-    if level_type == "techo":
-        # Queremos mecha arriba grande y cuerpo pequeño
-        score = (upper_w / range_) * 0.7 + (1 - body / range_) * 0.3
-    else:
-        # piso: mecha abajo grande
-        score = (lower_w / range_) * 0.7 + (1 - body / range_) * 0.3
-
-    # Si no estuvo “cerca del nivel” se penaliza un poco
-    if not near_level:
-        score *= 0.8
-    return max(0.0, min(1.0, score))
-
-def momentum_into_level(candles, idx, look=5):
-    """
-    Evalúa si venía con aceleración (velas consecutivas en la dirección del nivel).
-    Devuelve True/False.
-    """
-    if idx - look < 0:
-        return False
-    ups, downs = 0, 0
-    for i in range(idx - look, idx):
-        if candles[i]["close"] > candles[i]["open"]:
-            ups += 1
-        else:
-            downs += 1
-    # momentum si mayoría en una dirección
-    return (ups >= int(0.7 * look)) or (downs >= int(0.7 * look))
-
-def near_level(price, level, atr, k_atr=0.6, max_pct=0.20):
-    """Cerca si está dentro de k*ATR o dentro del % máximo (lo que sea más estricto)."""
-    cond_atr = (atr is not None) and (abs(price - level) <= k_atr * atr)
-    cond_pct = percent_dist(price, level) <= max_pct
-    return cond_atr or cond_pct
-
-# -------------------- Cliente Deriv --------------------
-class DerivWS:
-    def __init__(self, app_id, token):
-        self.url = f"wss://ws.derivws.com/websockets/v3?app_id={app_id}"
-        self.token = token
-        self.ws = None
-        self.lock = threading.Lock()
-        self.req_id = 1
-        self.connected = False
-        self._connect_and_auth()
-
-    def _connect_and_auth(self):
-        self.ws = websocket.create_connection(self.url, timeout=20)
-        self.connected = True
-        self._send({"authorize": self.token})
-        auth = self._recv()
-        if "error" in auth:
-            raise RuntimeError("Auth error: " + str(auth))
-        print("Deriv autorizado")
-
-    def _send(self, payload):
-        with self.lock:
-            payload["req_id"] = self.req_id
-            self.req_id += 1
-            self.ws.send(json.dumps(payload))
-
-    def _recv(self):
-        raw = self.ws.recv()
-        return json.loads(raw)
-
-    def candles(self, symbol, granularity, count=200):
-        """
-        Devuelve lista de velas dict: time, open, high, low, close
-        """
-        # Deriv permite máximo 5000 por request, usamos count razonable:
-        self._send({
-            "ticks_history": symbol,
-            "style": "candles",
-            "granularity": granularity,
-            "count": count,
-            "end": "latest",
-        })
-        data = self._recv()
-        if "error" in data:
-            raise RuntimeError(str(data["error"]))
-        cs = data.get("candles", [])
-        out = []
-        for c in cs:
-            out.append({
-                "time": c["epoch"],
-                "open": float(c["open"]),
-                "high": float(c["high"]),
-                "low": float(c["low"]),
-                "close": float(c["close"]),
-            })
-        return out
-
-    def close(self):
-        try:
-            self.ws.close()
-        except:
-            pass
-        self.connected = False
-
-# -------------------- Detección de niveles fuertes --------------------
-def detectar_niveles_fuertes(candles, min_touches, max_pct, atr):
-    """
-    1) pivotes -> 2) cluster -> 3) filtra por toques + rechazo + momentum
-    Devuelve lista de niveles dict:
-      {"type": 'piso'|'techo', "price": nivel, "touches": n, "evidences": [...]}
-    """
-    if len(candles) < ATR_PERIOD + 10:
+    if not precios:
         return []
+    precios = sorted(precios)
+    grupos = []
+    grp = [precios[0]]
+    for x in precios[1:]:
+        if abs(x - grp[-1]) <= tolerancia:
+            grp.append(x)
+        else:
+            grupos.append(grp)
+            grp = [x]
+    grupos.append(grp)
 
-    pivs = pivot_points(candles, left=2, right=2)
-    last_close = candles[-1]["close"]
-    clusters = cluster_levels(pivs, max_pct, last_close)
+    res = []
+    for g in grupos:
+        nivel = sum(g) / len(g)
+        res.append((nivel, len(g), g))
+    # Ordena por cantidad desc
+    res.sort(key=lambda x: x[1], reverse=True)
+    return res
 
-    out = []
-    for cl in clusters:
-        if cl["touches"] < min_touches:
-            continue
 
-        # evidencia de rechazo + momentum cerca del nivel
-        evidences = []
-        good_hits = 0
-        for m in cl["members"]:
-            i = m["idx"]
-            cndl = candles[i]
-            # estaba cerca del nivel?
-            near = near_level(cndl["close"], cl["price"], atr, k_atr=0.6, max_pct=max_pct)
-            score = wick_rejection_score(cndl, cl["type"], near_level=near)
-            mom = momentum_into_level(candles, i, look=5)
-            if near and score >= 0.6 and mom:
-                good_hits += 1
-                evidences.append({"idx": i, "score": round(score, 2)})
+def detectar_niveles(velas, atr, min_touches=5, tol_atr=0.3):
+    """
+    Encuentra niveles de soporte (pisos) y resistencia (techos) “claros”.
+    • min_touches: rechazos mínimos.
+    • tol_atr: ancho de cluster en múltiplos de ATR.
+    Retorna dict: {'pisos': [(nivel, toques)], 'techos': [...]}
+    """
+    hs, ls = pivotes(velas, win=3)
 
-        # exigimos que al menos 2 toques sean “buenos”
-        if good_hits >= 2:
-            out.append({
-                "type": cl["type"],
-                "price": cl["price"],
-                "touches": cl["touches"],
-                "evidences": evidences
-            })
+    highs_prec = [velas[i]["h"] for i in hs]
+    lows_prec  = [velas[i]["l"] for i in ls]
 
-    # ordena por cercanía al precio actual
-    out.sort(key=lambda x: abs(x["price"] - candles[-1]["close"]))
-    return out
+    tol = max(1e-9, atr * tol_atr)
+    c_hi = cluster_niveles(highs_prec, tol)
+    c_lo = cluster_niveles(lows_prec,  tol)
 
-# -------------------- Lógica principal --------------------
-def escanear_y_alertar(ws: DerivWS):
+    techos = [(nivel, cnt) for (nivel, cnt, _) in c_hi if cnt >= min_touches]
+    pisos  = [(nivel, cnt) for (nivel, cnt, _) in c_lo if cnt >= min_touches]
+
+    return {"pisos": techos if False else pisos, "techos": techos}
+
+
+# ------------ Formato de mensajes ------------
+def nombre_amigable(symbol):
+    return NOMBRE_LEGIBLE.get(symbol, symbol)
+
+
+def formatear_alerta(symbol, timeframe, tipo, nivel, toques, sl, tp, atr, evidencias=None):
+    """
+    tipo: 'PISO' o 'TECHO'
+    evidencias: int o None
+    """
+    titulo = f"📈 {nombre_amigable(symbol)} {timeframe} | ACERCÁNDOSE a {tipo} ~\n"
+    linea1 = f"Nivel ~ {nivel:.2f} (toques={toques})\n"
+    rr = RR_RATIO
+    linea2 = f"SL:{sl:.2f} | TP:{tp:.2f} | R/R=1:{int(rr)} | ATR={atr:.2f}\n"
+    linea3 = f"Evidencias: {evidencias} rechazos claros" if evidencias is not None else ""
+    return titulo + linea1 + linea2 + linea3
+
+
+# ------------ Lógica de escaneo ------------
+def escanear_symbol_tf(symbol, tf_name, gran):
+    """Escanea un símbolo en un timeframe y, si hay acercamiento, envía alertas."""
+    velas = pedir_velas(symbol, granularity=gran, count=500)
+    if len(velas) < ATR_PERIOD + 20:
+        return
+
+    atr = calc_atr(velas, ATR_PERIOD)
+    if atr <= 0:
+        return
+
+    niveles = detectar_niveles(velas, atr, min_touches=MIN_TOUCHES, tol_atr=0.35)
+    close = velas[-1]["c"]
+
+    # Distancia para considerar “acercándose”
+    near_dist = max(1e-9, atr * NEAR_ATR)
+
+    enviados = 0
+
+    # Pisos (soportes) cerca por debajo del precio
+    candidatos_piso = [x for x in niveles["pisos"] if (0 <= (close - x[0]) <= near_dist)]
+    # Techos (resistencias) cerca por encima del precio
+    candidatos_techo = [x for x in niveles["techos"] if (0 <= (x[0] - close) <= near_dist)]
+
+    candidatos_piso.sort(key=lambda x: abs(close - x[0]))
+    candidatos_techo.sort(key=lambda x: abs(x[0] - close))
+
+    for (nivel, toques) in candidatos_piso[:MAX_LEVELS_PER_TF]:
+        sl = nivel - SL_ATR_FACTOR * atr
+        tp = close + RR_RATIO * (close - sl)  # compra desde zona de soporte
+        msg = formatear_alerta(symbol, tf_name, "PISO", nivel, toques, sl, tp, atr, evidencias=toques)
+        tg_send(msg)
+        enviados += 1
+
+    for (nivel, toques) in candidatos_techo[:MAX_LEVELS_PER_TF]:
+        sl = nivel + SL_ATR_FACTOR * atr
+        tp = close - RR_RATIO * (sl - close)  # venta desde zona de resistencia
+        msg = formatear_alerta(symbol, tf_name, "TECHO", nivel, toques, sl, tp, atr, evidencias=toques)
+        tg_send(msg)
+        enviados += 1
+
+    return enviados
+
+
+def escanear_y_alertar():
+    total = 0
     for symbol in SYMBOLS:
-        for tf_name, gran in TIMEFRAMES.items():
+        for tf_name, gran in TF_MAP.items():
             try:
-                candles = ws.candles(symbol, granularity=gran, count=max(LOOKBACK_BARS, ATR_PERIOD + 50))
-                if len(candles) < ATR_PERIOD + 10:
-                    continue
-
-                atr = atr_from_candles(candles, ATR_PERIOD)
-                if atr is None or atr <= 0:
-                    continue
-
-                niveles = detectar_niveles_fuertes(
-                    candles=candles,
-                    min_touches=MIN_TOUCHES,
-                    max_pct=MAX_DISTANCE_PCT,
-                    atr=atr
-                )
-
-                if not niveles:
-                    continue
-
-                last = candles[-1]
-                last_price = last["close"]
-
-                for lv in niveles[:3]:  # máx 3 por tf/símbolo para no spamear
-                    # solo avisar si estamos ACERCÁNDONOS (no ruptura)
-                    # acercándose = precio aún no cruzó el nivel y distancia cae
-                    dist_pct = percent_dist(last_price, lv["price"])
-                    if dist_pct > MAX_DISTANCE_PCT:
-                        continue
-                    tipo = "PISO" if lv["type"] == "piso" else "TECHO"
-
-                    # SL/TP estimados (atr-based + R/R único)
-                    sl = lv["price"] - SL_ATR_FACTOR * atr if lv["type"] == "piso" else lv["price"] + SL_ATR_FACTOR * atr
-                    tp = lv["price"] + RR_RATIO * (lv["price"] - sl) if lv["type"] == "piso" else lv["price"] - RR_RATIO * (sl - lv["price"])
-
-                    msg = (
-                        f"📈 <b>{symbol} {tf_name}</b> | <b>ACERCÁNDOSE a {tipo}</b>\n"
-                        f"Nivel ~ <b>{lv['price']:.2f}</b> (toques={lv['touches']})\n"
-                        f"SL:<code>{sl:.2f}</code> | TP:<code>{tp:.2f}</code> | R/R=1:{int(RR_RATIO)} | ATR={atr:.2f}\n"
-                        f"Evidencias: {len(lv['evidences'])} rechazos claros"
-                    )
-                    print(msg)
-                    send_telegram(msg)
-
-            except Exception as e:
-                print(f"[{symbol} {tf_name}] Error:", e)
+                enviados = escanear_symbol_tf(symbol, tf_name, gran)
+                if enviados:
+                    total += enviados
+            except Exception:
                 traceback.print_exc()
-                # Si algo raro, esperamos un poco
-                time.sleep(2)
+                time.sleep(1)
+    if total:
+        print(f"Enviadas {total} alertas.")
+    else:
+        print("Sin acercamientos claros.")
 
+
+# ------------ Main loop ------------
 def run():
-    if not DERIV_APP_ID or not DERIV_TOKEN:
-        raise RuntimeError("Faltan DERIV_APP_ID o DERIV_TOKEN")
-    ws = None
+    if not DERIV_APP_ID or not TG_TOKEN or not TG_CHAT:
+        raise RuntimeError("Faltan variables: DERIV_APP_ID, TG_TOKEN, TG_CHAT")
+
+    # Descubrir símbolos y nombres
+    global SYMBOLS, NOMBRE_LEGIBLE
     try:
-        ws = DerivWS(DERIV_APP_ID, DERIV_TOKEN)
-        print("✅ Bot iniciado. Escaneando niveles fuertes…")
-        # Ciclo principal: escanea cada N minutos (por defecto 2)
+        SYMBOLS, NOMBRE_LEGIBLE = descubrir_simbolos_y_nombres()
+        print(f"🔎 Símbolos a escanear: {len(SYMBOLS)}")
+        if SYMBOLS:
+            print("Ejemplos:", [NOMBRE_LEGIBLE.get(s, s) for s in SYMBOLS[:8]])
+    except Exception:
+        traceback.print_exc()
+        # Si falló, quedarán listas por defecto dentro de la función
+
+    print("✅ Bot iniciado. Escaneando niveles…")
+    tg_send("🤖 PisosYTechos Bot iniciado.")
+
+    try:
         while True:
-            escanear_y_alertar(ws)
-            time.sleep(120)
+            escanear_y_alertar()
+            time.sleep(120)  # cada 2 minutos
     except KeyboardInterrupt:
         pass
-    except Exception as e:
-        print("Fallo crítico:", e)
+    except Exception:
+        print("Fallo crítico:")
         traceback.print_exc()
         time.sleep(5)
-    finally:
-        if ws:
-            ws.close()
+
 
 if __name__ == "__main__":
     run()
