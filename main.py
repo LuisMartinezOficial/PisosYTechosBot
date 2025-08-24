@@ -9,7 +9,7 @@ PisosYTechos Bot (Deriv API + Telegram)
 - TP = R/R (default 1:10).
 """
 
-import os, time, json, requests, websocket, traceback
+import os, time, json, requests, traceback
 import numpy as np
 
 # -------- Config desde Railway --------
@@ -25,24 +25,16 @@ MIN_TOUCHES   = int(os.getenv("MIN_TOUCHES", 2))     # mínimo de toques
 MIN_RECHAZOS  = int(os.getenv("MIN_RECHAZOS", 2))    # mínimo de rechazos claros
 
 # -------- Funciones utilitarias --------
-def ws_call(payload, timeout=25, retries=3):
-    """
-    Conecta al WS de Deriv, manda payload y devuelve la respuesta JSON.
-    Reintenta si el socket se cierra inesperadamente.
-    """
-    url = "wss://ws.derivws.com/websockets/v3?app_id=" + str(DERIV_APP_ID)
-    last_err = None
-    for _ in range(retries):
-        try:
-            ws = websocket.create_connection(url, timeout=timeout)
-            ws.send(json.dumps(payload))
-            raw = ws.recv()
-            ws.close()
-            return json.loads(raw)
-        except Exception as e:
-            last_err = e
-            time.sleep(1)
-    raise last_err
+def deriv_call(payload):
+    """Consulta al API de Deriv (HTTP, no WS persistente)."""
+    url = f"https://api.deriv.com/api/v3"
+    headers = {"Content-Type":"application/json"}
+    try:
+        r = requests.post(url, headers=headers, data=json.dumps(payload))
+        return r.json()
+    except Exception as e:
+        print("Error HTTP:", e)
+        return {}
 
 def enviar_telegram(msg):
     if not TG_TOKEN or not TG_CHAT:
@@ -65,16 +57,11 @@ def calcular_atr(candles, period=14):
 
 # -------- Nueva lógica de pisos/techos --------
 def detectar_pisos_techos(precios, min_touches=2, min_rechazos=2, tol=0.001):
-    """
-    Devuelve lista de niveles clave con rechazos claros.
-    """
     niveles = []
     for i in range(2, len(precios)-2):
         p = precios[i]
-        # piso
         if precios[i-2] > p and precios[i-1] > p and precios[i+1] > p and precios[i+2] > p:
             niveles.append(("piso", p))
-        # techo
         if precios[i-2] < p and precios[i-1] < p and precios[i+1] < p and precios[i+2] < p:
             niveles.append(("techo", p))
 
@@ -90,10 +77,8 @@ def detectar_pisos_techos(precios, min_touches=2, min_rechazos=2, tol=0.001):
         if not found:
             clusters.append({"tipo":tipo,"nivel":px,"toques":1,"precios":[px]})
 
-    # filtrar solo fuertes
     clusters = [c for c in clusters if c["toques"]>=min_touches]
 
-    # contar rechazos claros
     for c in clusters:
         rechazos = sum([1 for px in c["precios"] if abs(px-c["nivel"])<=c["nivel"]*tol])
         c["rechazos"] = rechazos
@@ -104,21 +89,21 @@ def detectar_pisos_techos(precios, min_touches=2, min_rechazos=2, tol=0.001):
 # -------- Escaneo --------
 def escanear_y_alertar(symbol, tf="M15"):
     try:
+        granularities = {"M15":900,"M30":1800,"H1":3600,"H4":14400,"D1":86400}
         req = {
             "ticks_history": symbol,
             "adjust_start_time": 1,
             "count": 200,
-            "granularity": {"M15":900,"M30":1800,"H1":3600,"H4":14400,"D1":86400}[tf],
+            "granularity": granularities[tf],
             "style": "candles",
             "end": "latest"
         }
-        data = ws_call(req)
+        data = deriv_call(req)
         candles = data.get("candles", [])
         if len(candles)<30: return
 
         precios = [c["close"] for c in candles]
         atr = calcular_atr(candles, ATR_PERIOD)
-
         niveles = detectar_pisos_techos(precios, MIN_TOUCHES, MIN_RECHAZOS)
 
         for n in niveles:
@@ -140,22 +125,21 @@ def escanear_y_alertar(symbol, tf="M15"):
 
     except Exception as e:
         print(f"[{symbol} {tf}] Error:",e)
+        traceback.print_exc()
 
 # -------- Main --------
 def run():
     print("✅ Bot iniciado. Escaneando...")
     timeframes = ["M15","M30","H1","H4","D1"]
-    # incluye volatility, jump, step, multi-step
     indices = ["R_10","R_25","R_50","R_75","R_100",
                "JD10","JD25","JD50","JD75","JD100",
                "1HZ10V","1HZ25V","1HZ50V","1HZ75V","1HZ100V",
-               "STeP1","STeP2","STeP3","STeP4","STeP5",
-               "MS10","MS25","MS50","MS75","MS100"]
+               "STEPINDEX","MULTISTEPINDEX"]
     while True:
         for sym in indices:
             for tf in timeframes:
                 escanear_y_alertar(sym, tf)
-                time.sleep(1)
+                time.sleep(2)
         time.sleep(60)
 
 if __name__=="__main__":
